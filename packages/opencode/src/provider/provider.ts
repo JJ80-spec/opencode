@@ -82,6 +82,98 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   })
 }
 
+// ACV GATEWAY PATCH
+// Our internal ACV LLM gateway returns two things the Anthropic spec forbids,
+// both of which the @ai-sdk/anthropic zod parser rejects before opencode ever
+// sees the data:
+//   1. `caller: null` (and other null fields) injected into content_block_start
+//      tool_use blocks -> "expected object, received null".
+//   2. The entire SSE sequence replayed twice (same message id, two full
+//      message_start -> message_stop cycles).
+// We sit in front of the SDK parser at the raw response-stream level: strip any
+// null-valued key from each event's `content_block`, and drop every event of a
+// cycle whose message_start id was already seen. Gated to Anthropic streaming
+// responses; everything else passes through untouched.
+export function cleanAnthropicGatewaySSE(res: Response): Response {
+  if (!res.body) return res
+  if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
+
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const seen = new Set<string>()
+  let buffer = ""
+  let suppress = false
+
+  const transformEvent = (raw: string): string | undefined => {
+    if (raw.trim() === "") return suppress ? undefined : raw
+    const lines = raw.split("\n")
+    let dataIdx = -1
+    let data: any
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith("data:")) {
+        try {
+          data = JSON.parse(lines[i].slice(5).replace(/^ /, ""))
+        } catch {
+          data = undefined
+        }
+        dataIdx = i
+        break
+      }
+    }
+    // No parseable JSON data line (comments, pings): drop while suppressing a
+    // duplicate cycle, otherwise pass through verbatim.
+    if (dataIdx === -1 || data === null || typeof data !== "object") return suppress ? undefined : raw
+
+    if (data.type === "message_start") {
+      const id = data?.message?.id
+      if (typeof id === "string" && seen.has(id)) {
+        suppress = true
+        return undefined
+      }
+      if (typeof id === "string") seen.add(id)
+      suppress = false
+    } else if (suppress) {
+      return undefined
+    }
+
+    if (data.content_block && typeof data.content_block === "object") {
+      for (const k of Object.keys(data.content_block)) {
+        if (data.content_block[k] === null) delete data.content_block[k]
+      }
+    }
+
+    lines[dataIdx] = "data: " + JSON.stringify(data)
+    return lines.join("\n")
+  }
+
+  const body = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, ctrl) {
+        buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n")
+        let idx: number
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const segment = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          const out = transformEvent(segment)
+          if (out !== undefined) ctrl.enqueue(encoder.encode(out + "\n\n"))
+        }
+      },
+      flush(ctrl) {
+        buffer += decoder.decode()
+        if (buffer.length === 0) return
+        const out = transformEvent(buffer)
+        if (out !== undefined) ctrl.enqueue(encoder.encode(out))
+      },
+    }),
+  )
+
+  return new Response(body, {
+    headers: new Headers(res.headers),
+    status: res.status,
+    statusText: res.statusText,
+  })
+}
+
 function timeoutController(ms: number) {
   const ctl = new AbortController()
   const id = setTimeout(() => ctl.abort(new ProviderError.HeaderTimeoutError(ms)), ms)
@@ -1693,11 +1785,15 @@ export const layer = Layer.effect(
           const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
           if (combined) opts.signal = combined
 
-          const res = await fetchFn(input, {
+          const raw = await fetchFn(input, {
             ...opts,
             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
             timeout: false,
           }).finally(() => headerTimeoutCtl?.clear())
+
+          // ACV GATEWAY PATCH: clean non-spec fields / duplicate cycles out of
+          // the Anthropic SSE stream before the SDK's zod parser sees it.
+          const res = model.api.npm === "@ai-sdk/anthropic" ? cleanAnthropicGatewaySSE(raw) : raw
 
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)
