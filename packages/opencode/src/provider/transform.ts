@@ -442,6 +442,23 @@ export function message(msgs: ModelMessage[], model: Provider.Model, options: Re
     model.api.npm !== "@ai-sdk/gateway"
   ) {
     msgs = applyCaching(msgs, model)
+
+    // ACV GATEWAY PATCH
+    // Our internal ACV LLM gateway injects non-spec fields (e.g. `caller: null`)
+    // into tool_use content blocks in its Anthropic SSE responses. Those null
+    // fields are not in the Anthropic spec and fail OpenCode's Zod validation.
+    // Walk assistant messages and drop any null-valued key from tool_use blocks
+    // before validation. This only removes fields the gateway should never have
+    // sent — it does not loosen the schema or touch non-null fields.
+    for (const msg of msgs) {
+      if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue
+      for (const block of msg.content as any[]) {
+        if (block?.type !== "tool_use") continue
+        for (const k of Object.keys(block)) {
+          if (block[k] === null) delete block[k]
+        }
+      }
+    }
   }
 
   // Remap providerOptions keys from stored providerID to expected SDK key

@@ -204,7 +204,10 @@ const AnthropicStreamDelta = Schema.Struct({
 const AnthropicEvent = Schema.Struct({
   type: Schema.String,
   index: Schema.optional(Schema.Number),
-  message: Schema.optional(Schema.Struct({ usage: Schema.optional(AnthropicUsage) })),
+  // ACV GATEWAY PATCH: capture the message id so the stream state machine can
+  // de-duplicate gateways that replay the entire SSE sequence (see `step`).
+  // Additive optional field — does not loosen validation of any other payload.
+  message: Schema.optional(Schema.Struct({ id: Schema.optional(Schema.String), usage: Schema.optional(AnthropicUsage) })),
   content_block: Schema.optional(AnthropicStreamBlock),
   delta: Schema.optional(AnthropicStreamDelta),
   usage: Schema.optional(AnthropicUsage),
@@ -222,6 +225,11 @@ interface ParserState {
   readonly tools: ToolStream.State<number>
   readonly usage?: Usage
   readonly lifecycle: Lifecycle.State
+  // ACV GATEWAY PATCH: `seen` tracks message ids already processed so a replayed
+  // SSE cycle can be detected; `suppress` is set once a duplicate cycle starts
+  // and causes every remaining event in that cycle to be dropped (see `step`).
+  readonly seen: ReadonlySet<string>
+  readonly suppress: boolean
 }
 
 const invalid = ProviderShared.invalidRequest
@@ -802,7 +810,23 @@ const onError = (state: ParserState, event: AnthropicEvent): StepResult => [
 ]
 
 const step = (state: ParserState, event: AnthropicEvent) => {
-  if (event.type === "message_start") return Effect.succeed(onMessageStart(state, event))
+  // ACV GATEWAY PATCH
+  // Our internal ACV LLM gateway emits the entire Anthropic SSE sequence twice
+  // (same message id, two full message_start -> message_stop cycles). De-dup by
+  // message id: the first cycle is processed normally; when a message_start
+  // arrives whose id we have already seen, flip `suppress` on and emit nothing
+  // for the rest of that cycle so the duplicate produces no downstream events.
+  // A subsequent message_start with a new id clears suppression for that id.
+  if (event.type === "message_start") {
+    const id = event.message?.id
+    if (id !== undefined && state.seen.has(id)) {
+      return Effect.succeed<StepResult>([{ ...state, suppress: true }, NO_EVENTS])
+    }
+    const seen = id !== undefined ? new Set(state.seen).add(id) : state.seen
+    return Effect.succeed(onMessageStart({ ...state, seen, suppress: false }, event))
+  }
+  if (state.suppress) return Effect.succeed<StepResult>([state, NO_EVENTS])
+
   if (event.type === "content_block_start") return Effect.succeed(onContentBlockStart(state, event))
   if (event.type === "content_block_delta") return onContentBlockDelta(state, event)
   if (event.type === "content_block_stop") return onContentBlockStop(state, event)
@@ -827,7 +851,13 @@ export const protocol = Protocol.make({
   },
   stream: {
     event: Protocol.jsonEvent(AnthropicEvent),
-    initial: () => ({ tools: ToolStream.empty<number>(), lifecycle: Lifecycle.initial() }),
+    // ACV GATEWAY PATCH: `seen`/`suppress` seed the SSE de-duplication in `step`.
+    initial: () => ({
+      tools: ToolStream.empty<number>(),
+      lifecycle: Lifecycle.initial(),
+      seen: new Set<string>(),
+      suppress: false,
+    }),
     step,
   },
 })
