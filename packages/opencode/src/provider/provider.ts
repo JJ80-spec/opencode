@@ -17,6 +17,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
+import { appendFileSync } from "node:fs"
 import { pathToFileURL } from "url"
 import { Effect, Layer, Context, Schema, Types } from "effect"
 import { EffectBridge } from "@/effect/bridge"
@@ -94,7 +95,16 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
 // null-valued key from each event's `content_block`, and drop every event of a
 // cycle whose message_start id was already seen. Gated to Anthropic streaming
 // responses; everything else passes through untouched.
+// ACV GATEWAY PATCH: temporary diagnostic. Best-effort append to /tmp so we can
+// confirm whether this patched code is actually running and what it intercepts.
+function acvDiag(msg: string) {
+  try {
+    appendFileSync("/tmp/acv-patch.log", `${new Date().toISOString()} ${msg}\n`)
+  } catch {}
+}
+
 export function cleanAnthropicGatewaySSE(res: Response): Response {
+  acvDiag(`cleaner entered content-type=${res.headers.get("content-type") ?? "<none>"} hasBody=${!!res.body}`)
   if (!res.body) return res
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
 
@@ -128,6 +138,7 @@ export function cleanAnthropicGatewaySSE(res: Response): Response {
       const id = data?.message?.id
       if (typeof id === "string" && seen.has(id)) {
         suppress = true
+        acvDiag(`duplicate message_start id=${id} -> suppressing cycle`)
         return undefined
       }
       if (typeof id === "string") seen.add(id)
@@ -138,7 +149,10 @@ export function cleanAnthropicGatewaySSE(res: Response): Response {
 
     if (data.content_block && typeof data.content_block === "object") {
       for (const k of Object.keys(data.content_block)) {
-        if (data.content_block[k] === null) delete data.content_block[k]
+        if (data.content_block[k] === null) {
+          delete data.content_block[k]
+          acvDiag(`stripped null field "${k}" from content_block type=${data.type}`)
+        }
       }
     }
 
