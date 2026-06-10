@@ -3,14 +3,14 @@ import { Provider } from "../../src/provider/provider"
 
 // Builds a fake event-stream Response from raw SSE text, runs it through the
 // ACV gateway cleaner, and returns the cleaned SSE text.
-async function clean(sse: string): Promise<string> {
+async function clean(sse: string, contentType = "text/event-stream"): Promise<string> {
   const body = new ReadableStream<Uint8Array>({
     start(ctrl) {
       ctrl.enqueue(new TextEncoder().encode(sse))
       ctrl.close()
     },
   })
-  const res = new Response(body, { headers: { "content-type": "text/event-stream" } })
+  const res = new Response(body, { headers: { "content-type": contentType } })
   const out = Provider.cleanAnthropicGatewaySSE(res)
   return await new Response(out.body).text()
 }
@@ -42,6 +42,20 @@ describe("ACV gateway SSE cleaner — caller:null", () => {
     expect(out).toContain('"name":"read"')
     expect(out).toContain('"id":"toolu_1"')
     expect(out).not.toContain('"caller"')
+  })
+
+  it("still cleans when the gateway mislabels SSE as application/x-ndjson", async () => {
+    // The ACV gateway serves real SSE bytes under an application/x-ndjson
+    // content-type. The cleaner must process it regardless of the label.
+    const out = await clean(cycle("msg_1"), "application/x-ndjson")
+    expect(out).not.toContain('"caller"')
+    expect(out).toContain('"name":"read"')
+  })
+
+  it("passes through a non-streaming JSON body untouched", async () => {
+    const json = '{"type":"error","error":{"message":"boom"}}'
+    const out = await clean(json, "application/json")
+    expect(out).toBe(json)
   })
 })
 

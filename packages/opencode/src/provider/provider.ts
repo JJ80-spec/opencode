@@ -104,9 +104,15 @@ function acvDiag(msg: string) {
 }
 
 export function cleanAnthropicGatewaySSE(res: Response): Response {
-  acvDiag(`cleaner entered content-type=${res.headers.get("content-type") ?? "<none>"} hasBody=${!!res.body}`)
+  const contentType = res.headers.get("content-type") ?? ""
+  acvDiag(`cleaner entered content-type=${contentType || "<none>"} hasBody=${!!res.body}`)
   if (!res.body) return res
-  if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
+  // The ACV gateway streams native Anthropic SSE (event:/data:/\n\n) but
+  // mislabels the content-type as application/x-ndjson, so we accept both that
+  // and the spec content-type. Non-streaming bodies (e.g. JSON errors) carry
+  // neither and pass through untouched; the parser below also leaves any
+  // segment without a `data:` JSON line verbatim, so this is safe either way.
+  if (!contentType.includes("text/event-stream") && !contentType.includes("ndjson")) return res
 
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
